@@ -83,6 +83,10 @@
         height: 100%;
         pointer-events: none;
       }
+      canvas#canvas.placing {
+        pointer-events: auto;
+        cursor: crosshair;
+      }
       #alert {
         position: absolute;
         top: 12px;
@@ -128,6 +132,8 @@
         color: var(--accent);
         font-variant-numeric: tabular-nums;
       }
+      #hud b.blue { color: var(--blue); }
+      #hud b.green { color: var(--accent); }
       #overlayMsg {
         position: absolute;
         inset: 0;
@@ -213,6 +219,30 @@
       #tmStatus.ready {
         color: var(--accent);
       }
+      #spotsStatus {
+        flex: 1;
+        font-size: 11px;
+        color: var(--muted);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #add5Btn {
+        border-color: #22c55e;
+        color: #22c55e;
+      }
+      #add5Btn.spot-active {
+        background: #22c55e;
+        color: #06210f;
+      }
+      #add7Btn {
+        border-color: #60a5fa;
+        color: #60a5fa;
+      }
+      #add7Btn.spot-active {
+        background: #60a5fa;
+        color: #06203f;
+      }
 
       footer {
         padding: 11px 12px calc(11px + env(safe-area-inset-bottom));
@@ -280,7 +310,9 @@
         <div id="hud">
           FPS <b id="fps">0</b><br />
           Vehicles <b id="vcount">0</b> · Objects <b id="ocount">0</b><br />
-          Type <b id="vtype">—</b>
+          Type <b id="vtype">—</b><br />
+          Free <b id="free5" class="green">—</b>×P5 ·
+          <b id="free7" class="blue">—</b>×P7
         </div>
         <div id="overlayMsg">
           <div class="box">
@@ -311,6 +343,13 @@
           </button>
           <div id="plateOut">plate: —</div>
           <img id="plateThumb" alt="" />
+        </div>
+        <div class="row">
+          <button id="add5Btn" class="mini" disabled title="Click then tap video to place 5-seater spot">+P5</button>
+          <button id="add7Btn" class="mini" disabled title="Click then tap video to place 7-seater spot">+P7</button>
+          <button id="demoSpotsBtn" class="mini" disabled title="Add demo parking layout">Demo</button>
+          <button id="clearSpotsBtn" class="mini" disabled>✕ Spots</button>
+          <span id="spotsStatus">start camera, then place spots</span>
         </div>
         <div id="tmStatus">
           5/7-seater classifier: off (load a Teachable Machine model)
@@ -353,6 +392,13 @@
         const readPlate = $("readPlate"),
           plateOut = $("plateOut"),
           plateThumb = $("plateThumb");
+        const add5Btn = $("add5Btn"),
+          add7Btn = $("add7Btn"),
+          demoSpotsBtn = $("demoSpotsBtn"),
+          clearSpotsBtn = $("clearSpotsBtn"),
+          spotsStatus = $("spotsStatus");
+        const free5El = $("free5"),
+          free7El = $("free7");
 
         const VEHICLES = new Set([
           "car",
@@ -378,6 +424,247 @@
           frameCount = 0;
         let lastPreds = [],
           vehicleLabel = "";
+
+        // ---------- parking spots ----------
+        let parkingSpots = [];
+        let placingType = null; // '5-seater' | '7-seater' | null
+        let spotIdCounter = 0;
+
+        function setPlacingMode(type) {
+          placingType = placingType === type ? null : type;
+          add5Btn.classList.toggle("spot-active", placingType === "5-seater");
+          add7Btn.classList.toggle("spot-active", placingType === "7-seater");
+          canvas.classList.toggle("placing", placingType !== null);
+          updateSpotsStatus();
+        }
+
+        function updateSpotsStatus() {
+          const n5 = parkingSpots.filter((s) => s.type === "5-seater").length;
+          const n7 = parkingSpots.filter((s) => s.type === "7-seater").length;
+          if (placingType) {
+            spotsStatus.textContent = `placing ${placingType} — tap video to drop spot (dbl-tap spot to remove)`;
+          } else if (parkingSpots.length === 0) {
+            spotsStatus.textContent = "no spots — click +P5 or +P7 then tap video";
+          } else {
+            spotsStatus.textContent = `${parkingSpots.length} spots: ${n5}×P5, ${n7}×P7 — dbl-tap spot to remove`;
+          }
+        }
+
+        // Convert stage-relative click position → video pixel coords
+        function stageToVideo(clientX, clientY) {
+          const rect = stage.getBoundingClientRect();
+          const px = (clientX - rect.left) * (canvas.width / rect.width);
+          const py = (clientY - rect.top) * (canvas.height / rect.height);
+          const vw = video.videoWidth,
+            vh = video.videoHeight;
+          if (!vw || !vh) return null;
+          const scale = Math.min(canvas.width / vw, canvas.height / vh);
+          const ox = (canvas.width - vw * scale) / 2;
+          const oy = (canvas.height - vh * scale) / 2;
+          const vx = (px - ox) / scale;
+          const vy = (py - oy) / scale;
+          if (vx < 0 || vy < 0 || vx > vw || vy > vh) return null;
+          return { vx, vy };
+        }
+
+        // Place spot on canvas click (when in placing mode)
+        canvas.addEventListener("click", (e) => {
+          if (!placingType || !running) return;
+          const c = stageToVideo(e.clientX, e.clientY);
+          if (!c) return;
+          const vw = video.videoWidth,
+            vh = video.videoHeight;
+          const sw = placingType === "7-seater" ? vw * 0.14 : vw * 0.11;
+          const sh = placingType === "7-seater" ? vh * 0.30 : vh * 0.25;
+          parkingSpots.push({
+            id: ++spotIdCounter,
+            type: placingType,
+            x: c.vx - sw / 2,
+            y: c.vy - sh / 2,
+            w: sw,
+            h: sh,
+          });
+          updateSpotsStatus();
+        });
+
+        // Double-tap/click an existing spot to remove it
+        stage.addEventListener("dblclick", (e) => {
+          if (!running || parkingSpots.length === 0) return;
+          const c = stageToVideo(e.clientX, e.clientY);
+          if (!c) return;
+          const idx = parkingSpots.findIndex(
+            (s) =>
+              c.vx >= s.x &&
+              c.vx <= s.x + s.w &&
+              c.vy >= s.y &&
+              c.vy <= s.y + s.h,
+          );
+          if (idx !== -1) {
+            parkingSpots.splice(idx, 1);
+            updateSpotsStatus();
+          }
+        });
+
+        add5Btn.addEventListener("click", () => setPlacingMode("5-seater"));
+        add7Btn.addEventListener("click", () => setPlacingMode("7-seater"));
+
+        clearSpotsBtn.addEventListener("click", () => {
+          parkingSpots = [];
+          setPlacingMode(null); // also exits placing mode
+          updateSpotsStatus();
+          free5El.textContent = "—";
+          free7El.textContent = "—";
+        });
+
+        demoSpotsBtn.addEventListener("click", () => {
+          const vw = video.videoWidth || 640;
+          const vh = video.videoHeight || 480;
+          parkingSpots = [
+            { id: ++spotIdCounter, type: "5-seater", x: vw * 0.03, y: vh * 0.22, w: vw * 0.12, h: vh * 0.28 },
+            { id: ++spotIdCounter, type: "5-seater", x: vw * 0.18, y: vh * 0.22, w: vw * 0.12, h: vh * 0.28 },
+            { id: ++spotIdCounter, type: "7-seater", x: vw * 0.33, y: vh * 0.19, w: vw * 0.15, h: vh * 0.33 },
+            { id: ++spotIdCounter, type: "7-seater", x: vw * 0.51, y: vh * 0.19, w: vw * 0.15, h: vh * 0.33 },
+            { id: ++spotIdCounter, type: "5-seater", x: vw * 0.69, y: vh * 0.22, w: vw * 0.12, h: vh * 0.28 },
+            { id: ++spotIdCounter, type: "5-seater", x: vw * 0.84, y: vh * 0.22, w: vw * 0.12, h: vh * 0.28 },
+          ];
+          updateSpotsStatus();
+        });
+
+        // ---------- parking spot helpers ----------
+
+        // Returns rgba string for a hex color + alpha
+        function hexA(hex, a) {
+          const r = parseInt(hex.slice(1, 3), 16);
+          const g = parseInt(hex.slice(3, 5), 16);
+          const b = parseInt(hex.slice(5, 7), 16);
+          return `rgba(${r},${g},${b},${a.toFixed(2)})`;
+        }
+
+        function poly(pts, fill, stroke) {
+          ctx.beginPath();
+          ctx.moveTo(pts[0][0], pts[0][1]);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+          ctx.closePath();
+          if (fill) {
+            ctx.fillStyle = fill;
+            ctx.fill();
+          }
+          if (stroke) {
+            ctx.strokeStyle = stroke;
+            ctx.stroke();
+          }
+        }
+
+        // Returns true if ≥30% of spot area is covered by any vehicle bbox
+        function isOccupied(spot, vehicles) {
+          return vehicles.some((v) => {
+            const [vx, vy, vw, vh] = v.bbox;
+            const ox = Math.max(0, Math.min(spot.x + spot.w, vx + vw) - Math.max(spot.x, vx));
+            const oy = Math.max(0, Math.min(spot.y + spot.h, vy + vh) - Math.max(spot.y, vy));
+            return (ox * oy) / (spot.w * spot.h) > 0.30;
+          });
+        }
+
+        // Draw one 3D parking spot box on canvas coords (cx,cy,cw,ch)
+        function draw3DSpot(cx, cy, cw, ch, type, occupied, t) {
+          const COL5 = "#22c55e";
+          const COL7 = "#60a5fa";
+          const COLOCC = "#ef4444";
+          const col = occupied ? COLOCC : type === "7-seater" ? COL7 : COL5;
+          const lw = Math.max(1.5, canvas.width / 500);
+          ctx.lineWidth = lw;
+
+          // 3-D extrusion parameters
+          const eH = ch * 0.38;   // extrude height upward in canvas
+          const eX = cw * 0.10;   // rightward skew (perspective)
+
+          if (occupied) {
+            // Red filled rectangle + X
+            ctx.fillStyle = hexA(COLOCC, 0.25);
+            ctx.fillRect(cx, cy, cw, ch);
+            ctx.strokeStyle = COLOCC;
+            ctx.strokeRect(cx, cy, cw, ch);
+            ctx.beginPath();
+            ctx.moveTo(cx + cw * 0.2, cy + ch * 0.2);
+            ctx.lineTo(cx + cw * 0.8, cy + ch * 0.8);
+            ctx.moveTo(cx + cw * 0.8, cy + ch * 0.2);
+            ctx.lineTo(cx + cw * 0.2, cy + ch * 0.8);
+            ctx.strokeStyle = COLOCC;
+            ctx.stroke();
+            return;
+          }
+
+          // --- pulsing alpha ---
+          const pulse = 0.12 + 0.07 * Math.sin(t / 600);
+
+          // --- Ground / front face ---
+          ctx.fillStyle = hexA(col, pulse);
+          ctx.fillRect(cx, cy, cw, ch);
+          ctx.strokeStyle = col;
+          ctx.strokeRect(cx, cy, cw, ch);
+
+          // --- Top face (parallelogram) ---
+          poly(
+            [
+              [cx,      cy],
+              [cx + cw, cy],
+              [cx + cw + eX, cy - eH],
+              [cx + eX,      cy - eH],
+            ],
+            hexA(col, 0.28),
+            col,
+          );
+
+          // --- Right face ---
+          poly(
+            [
+              [cx + cw,      cy],
+              [cx + cw + eX, cy - eH],
+              [cx + cw + eX, cy + ch - eH],
+              [cx + cw,      cy + ch],
+            ],
+            hexA(col, 0.20),
+            col,
+          );
+
+          // --- Left vertical edge ---
+          ctx.beginPath();
+          ctx.moveTo(cx,      cy);
+          ctx.lineTo(cx + eX, cy - eH);
+          ctx.moveTo(cx,      cy + ch);
+          ctx.lineTo(cx + eX, cy + ch - eH);
+          ctx.strokeStyle = col;
+          ctx.stroke();
+
+          // --- Bottom back edge ---
+          ctx.beginPath();
+          ctx.moveTo(cx + eX,      cy + ch - eH);
+          ctx.lineTo(cx + cw + eX, cy + ch - eH);
+          ctx.strokeStyle = col;
+          ctx.stroke();
+
+          // --- Glow ---
+          ctx.save();
+          ctx.shadowBlur = 14;
+          ctx.shadowColor = col;
+          ctx.strokeStyle = col;
+          ctx.strokeRect(cx, cy, cw, ch);
+          ctx.restore();
+
+          // --- Label ---
+          const fs = Math.max(11, Math.round(ch * 0.22));
+          ctx.font = `700 ${fs}px -apple-system,sans-serif`;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillStyle = col;
+          ctx.fillText(
+            type === "7-seater" ? "P7" : "P5",
+            cx + cw / 2,
+            cy + ch / 2,
+          );
+          ctx.textAlign = "left";
+          ctx.textBaseline = "top";
+        }
 
         if (!window.isSecureContext) {
           warnTitle.textContent = "⚠️ HTTPS chahiye";
@@ -431,6 +718,10 @@
             flipBtn.disabled = false;
             soundBtn.disabled = false;
             readPlate.disabled = false;
+            add5Btn.disabled = false;
+            add7Btn.disabled = false;
+            demoSpotsBtn.disabled = false;
+            clearSpotsBtn.disabled = false;
             startBtn.textContent = "Stop";
             startBtn.classList.remove("primary");
             startBtn.classList.add("danger");
@@ -457,11 +748,18 @@
           flipBtn.disabled = true;
           soundBtn.disabled = true;
           readPlate.disabled = true;
+          add5Btn.disabled = true;
+          add7Btn.disabled = true;
+          demoSpotsBtn.disabled = true;
+          clearSpotsBtn.disabled = true;
+          setPlacingMode(null);
           alertEl.classList.remove("on");
           vcountEl.textContent = "0";
           ocountEl.textContent = "0";
           fpsEl.textContent = "0";
           vtypeEl.textContent = "—";
+          free5El.textContent = "—";
+          free7El.textContent = "—";
           overlayMsg.classList.remove("hidden");
           warnTitle.textContent = "Stopped";
           overlayText.textContent = 'Dobara test karne ke liye "Start" dabao.';
@@ -510,7 +808,6 @@
             if (v < lo) lo = v;
             if (v > hi) hi = v;
           }
-          // contrast-stretch threshold: midpoint between darkest and brightest pixel
           const thresh = (lo + hi) / 2;
           for (let i = 0, j = 0; i < d.length; i += 4, j++) {
             const v = g[j] >= thresh ? 255 : 0;
@@ -618,6 +915,28 @@
           ctx.lineWidth = Math.max(2, canvas.width / 260);
           ctx.textBaseline = "top";
           const big = largestVehicle(preds);
+          const vehicles = preds.filter((p) => VEHICLES.has(p.class));
+          const t = performance.now();
+
+          // --- Draw parking spots ---
+          let free5 = 0, free7 = 0;
+          parkingSpots.forEach((spot) => {
+            const occupied = isOccupied(spot, vehicles);
+            if (!occupied) {
+              spot.type === "5-seater" ? free5++ : free7++;
+            }
+            const cx = spot.x * scale + ox;
+            const cy = spot.y * scale + oy;
+            const cw = spot.w * scale;
+            const ch = spot.h * scale;
+            draw3DSpot(cx, cy, cw, ch, spot.type, occupied, t);
+          });
+          if (parkingSpots.length > 0) {
+            free5El.textContent = free5;
+            free7El.textContent = free7;
+          }
+
+          // --- Draw COCO detections ---
           preds.forEach((p) => {
             const isV = VEHICLES.has(p.class);
             const color = isV ? "#22c55e" : "#60a5fa";
@@ -673,7 +992,7 @@
           tWorker = await Tesseract.createWorker("eng");
           await tWorker.setParameters({
             tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-            tessedit_pageseg_mode: "13", // raw line — best for license plates
+            tessedit_pageseg_mode: "13",
           });
           return tWorker;
         }
@@ -690,10 +1009,7 @@
               : [video.videoWidth * 0.1, video.videoHeight * 0.3,
                  video.videoWidth * 0.8, video.videoHeight * 0.4];
 
-            // Try 3 crop regions: bottom 35%, 40%, 45% of vehicle bbox
             const fracs = big ? [0.65, 0.60, 0.55] : [undefined];
-
-            // Show the tightest crop as thumbnail
             const thumb = cropCanvas(bbox, 800, 200, fracs[0]);
             plateThumb.src = thumb.toDataURL();
             plateThumb.style.display = "block";
@@ -703,7 +1019,6 @@
 
             for (const frac of fracs) {
               const raw = cropCanvas(bbox, 800, 200, frac);
-              // binarized copy
               const bin = document.createElement("canvas");
               bin.width = raw.width; bin.height = raw.height;
               bin.getContext("2d").drawImage(raw, 0, 0);
@@ -717,7 +1032,6 @@
                 } catch (e) {}
               }
 
-              // Stop early if we already have a plausible plate (≥6 chars)
               if (bestText.length >= 6) break;
             }
 
